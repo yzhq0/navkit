@@ -4,7 +4,7 @@ from __future__ import annotations
 import warnings
 import logging
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, Iterable
 
 import numpy as np
 import pandas as pd
@@ -58,6 +58,7 @@ class NavAnalyzer:
         self.bm_ret_: Optional[pd.Series] = None
         self.active_ret_: Optional[pd.Series] = None
         self.summary_: Optional[Dict[str, Any]] = None
+        self.summary_raw_: Optional[Dict[str, Any]] = None
 
     # ----------------------------- 公共主流程 ----------------------------- #
     def fit(self) -> "NavAnalyzer":
@@ -98,12 +99,23 @@ class NavAnalyzer:
         self.freq_info = freq_info
         stats_start = self.ret_.index.min() if self.ret_ is not None and len(self.ret_) else (self.nav_.dropna().index.min() if self.nav_ is not None else None)
         stats_end = self.ret_.index.max() if self.ret_ is not None and len(self.ret_) else (self.nav_.dropna().index.max() if self.nav_ is not None else None)
-        self.summary_ = {
+        # 原始汇总（保留频率细节为 dict，便于调试/兼容）
+        self.summary_raw_ = {
             "frequency": freq_info.label,
             "periods_per_year": freq_info.periods_per_year,
             "frequency_detail": freq_info.detail,
             "stats_start": stats_start,
             "stats_end": stats_end,
+            **metrics,
+        }
+        # 展示友好版：扁平化 frequency_detail，避免 DataFrame 中混入 dict
+        freq_flat = self._flatten_frequency_detail(freq_info.detail)
+        self.summary_ = {
+            "frequency": freq_info.label,
+            "periods_per_year": freq_info.periods_per_year,
+            "stats_start": stats_start,
+            "stats_end": stats_end,
+            **freq_flat,
             **metrics,
         }
         return self
@@ -412,6 +424,10 @@ class NavAnalyzer:
         downside_std = downside.std(ddof=1)
         sortino = ((ret - mar_per).mean() / (downside_std + 1e-12) * np.sqrt(ppy)) if n > 1 else np.nan
 
+        # upside volatility（对称于 downside，使用正的偏离）
+        upside = np.clip(ret - mar_per, a_min=0, a_max=None)
+        upside_std_ann = upside.std(ddof=1) * np.sqrt(ppy) if n > 1 else np.nan
+
         wealth = (1.0 + ret).cumprod()
         wealth_idx = ret.index
         wealth = pd.Series(wealth.values, index=wealth_idx)
@@ -420,6 +436,43 @@ class NavAnalyzer:
 
         period_return = growth - 1.0
 
+        # 分布/尾部
+        try:
+            skewness = ret.skew()
+            kurtosis = ret.kurtosis()
+        except Exception:
+            skewness = np.nan
+            kurtosis = np.nan
+        try:
+            q5 = float(np.nanpercentile(ret.values, 5))
+            var_95 = -q5  # 以正的损失表达
+            cvar_95 = -float(np.nanmean(ret[ret <= q5])) if np.isfinite(q5) else np.nan
+        except Exception:
+            var_95 = np.nan
+            cvar_95 = np.nan
+
+        # 一致性
+        up_mask = ret > 0
+        down_mask = ret < 0
+        win_rate = float(up_mask.mean()) if n > 0 else np.nan
+        avg_up = float(ret[up_mask].mean()) if up_mask.any() else np.nan
+        avg_down = float(ret[down_mask].mean()) if down_mask.any() else np.nan
+        gain_loss_ratio = (abs(avg_up) / (abs(avg_down) + 1e-12)) if np.isfinite(avg_up) and np.isfinite(avg_down) else np.nan
+        # 最大连续涨/跌
+        max_up_streak = 0
+        max_down_streak = 0
+        cur_up = 0
+        cur_down = 0
+        for v in ret.values:
+            if np.isfinite(v) and v > 0:
+                cur_up += 1; max_up_streak = max(max_up_streak, cur_up)
+                cur_down = 0
+            elif np.isfinite(v) and v < 0:
+                cur_down += 1; max_down_streak = max(max_down_streak, cur_down)
+                cur_up = 0
+            else:
+                cur_up = 0; cur_down = 0
+
         metrics = {
             f"{label_prefix}period_return": period_return,
             f"{label_prefix}annual_return": ann_return,
@@ -427,6 +480,7 @@ class NavAnalyzer:
             f"{label_prefix}sharpe": sharpe,
             f"{label_prefix}sortino": sortino,
             f"{label_prefix}downside_risk_annual": downside_std * np.sqrt(ppy) if n > 1 else np.nan,
+            f"{label_prefix}upside_vol_annual": upside_std_ann,
             f"{label_prefix}max_drawdown": dd,
             f"{label_prefix}max_drawdown_start": dd_start,
             f"{label_prefix}max_drawdown_trough": dd_trough,
@@ -436,6 +490,16 @@ class NavAnalyzer:
             f"{label_prefix}longest_underwater_start": longest_underwater[1],
             f"{label_prefix}longest_underwater_end": longest_underwater[2],
             f"{label_prefix}n_periods": n,
+            f"{label_prefix}skewness": float(skewness) if np.isfinite(skewness) else np.nan,
+            f"{label_prefix}kurtosis": float(kurtosis) if np.isfinite(kurtosis) else np.nan,
+            f"{label_prefix}VaR_95": float(var_95) if np.isfinite(var_95) else np.nan,
+            f"{label_prefix}CVaR_95": float(cvar_95) if np.isfinite(cvar_95) else np.nan,
+            f"{label_prefix}win_rate": float(win_rate) if np.isfinite(win_rate) else np.nan,
+            f"{label_prefix}avg_up_return": float(avg_up) if np.isfinite(avg_up) else np.nan,
+            f"{label_prefix}avg_down_return": float(avg_down) if np.isfinite(avg_down) else np.nan,
+            f"{label_prefix}gain_loss_ratio": float(gain_loss_ratio) if np.isfinite(gain_loss_ratio) else np.nan,
+            f"{label_prefix}max_consecutive_up": int(max_up_streak),
+            f"{label_prefix}max_consecutive_down": int(max_down_streak),
         }
         return metrics
 
@@ -491,12 +555,26 @@ class NavAnalyzer:
         var_b = cov[0, 0]
         beta = cov[0, 1] / (var_b + 1e-12)
         alpha_per = r.mean() - beta * b.mean()
+        # 回归统计
+        n = len(common)
+        resid = r - (alpha_per + beta * b)
+        sse = float(np.sum((resid.values if isinstance(resid, pd.Series) else resid) ** 2))
+        sst = float(np.sum(((r - r.mean()).values if isinstance(r, pd.Series) else (r - r.mean())) ** 2))
+        r2 = 1.0 - (sse / (sst + 1e-12)) if n > 2 else np.nan
+        s2 = sse / max(n - 2, 1)
+        sxx = float(np.sum(((b - b.mean()).values if isinstance(b, pd.Series) else (b - b.mean())) ** 2))
+        se_beta = np.sqrt(s2 / (sxx + 1e-12)) if n > 2 else np.nan
+        se_alpha = np.sqrt(s2 * (1.0 / n + (b.mean() ** 2) / (sxx + 1e-12))) if n > 2 else np.nan
+        beta_t = float(beta) / (se_beta + 1e-12) if np.isfinite(se_beta) else np.nan
+        alpha_t = float(alpha_per) / (se_alpha + 1e-12) if np.isfinite(se_alpha) else np.nan
         alpha_ann = (1.0 + alpha_per) ** ppy - 1.0
         # 捕获比
         up_mask = b > 0
         down_mask = b < 0
         up_capture = (r[up_mask].mean() / (b[up_mask].mean() + 1e-12)) if up_mask.any() else np.nan
         down_capture = (r[down_mask].mean() / (b[down_mask].mean() + 1e-12)) if down_mask.any() else np.nan
+        # Hit ratio vs BM（胜率）
+        hit_ratio = float((r - b > 0).mean()) if len(r) > 0 else np.nan
         # 超额累计/年化、超额回撤
         if len(active) >= 1:
             active_growth = float((1.0 + active).prod())
@@ -509,13 +587,29 @@ class NavAnalyzer:
             excess_period_return = np.nan
             excess_ann = np.nan
             dd = np.nan; dd_start = None; dd_trough = None; dd_recover = None; longest_underwater = (0, None, None)
+        excess_calmar = (excess_ann / abs(dd)) if isinstance(dd, (int, float, np.floating)) and abs(dd) > 1e-12 else np.nan
+        # 主动 downside 风险（以 0 作为 MAR）
+        active_down = np.clip(active, a_max=0, a_min=None)
+        excess_downside_risk_ann = active_down.std(ddof=1) * np.sqrt(ppy) if len(active) > 1 else np.nan
+        # Treynor（年化）：(E[r]-rf)/beta * ppy
+        rf_per = (1.0 + self.rf_annual) ** (1.0 / ppy) - 1.0
+        treynor = ((r.mean() - rf_per) * ppy) / (float(beta) + 1e-12) if np.isfinite(beta) else np.nan
+        # M^2（Modigliani）：Sharpe * σ_bm + R_f
+        sharpe_r = ((r - rf_per).mean() / (r.std(ddof=1) + 1e-12)) * np.sqrt(ppy) if len(r) > 1 else np.nan
+        bm_vol_ann = b.std(ddof=1) * np.sqrt(ppy) if len(b) > 1 else np.nan
+        m2 = sharpe_r * bm_vol_ann + self.rf_annual if np.isfinite(sharpe_r) and np.isfinite(bm_vol_ann) else np.nan
         return {
             "active_te": te,
             "active_ir": ir,
             "beta": float(beta),
             "alpha_annual": float(alpha_ann),
+            "alpha_tstat": float(alpha_t) if np.isfinite(alpha_t) else np.nan,
+            "beta_tstat": float(beta_t) if np.isfinite(beta_t) else np.nan,
+            "r2": float(r2) if np.isfinite(r2) else np.nan,
             "up_capture": float(up_capture) if np.isfinite(up_capture) else np.nan,
             "down_capture": float(down_capture) if np.isfinite(down_capture) else np.nan,
+            "hit_ratio_vs_bm": float(hit_ratio) if np.isfinite(hit_ratio) else np.nan,
+            "excess_win_rate": float(hit_ratio) if np.isfinite(hit_ratio) else np.nan,
             "excess_period_return": float(excess_period_return) if np.isfinite(excess_period_return) else np.nan,
             "excess_annual_return": float(excess_ann) if np.isfinite(excess_ann) else np.nan,
             "excess_max_drawdown": float(dd) if isinstance(dd, (int, float, np.floating)) else np.nan,
@@ -525,6 +619,10 @@ class NavAnalyzer:
             "excess_longest_underwater_periods": int(longest_underwater[0]) if isinstance(longest_underwater[0], (int, np.integer)) else 0,
             "excess_longest_underwater_start": longest_underwater[1],
             "excess_longest_underwater_end": longest_underwater[2],
+            "excess_calmar": float(excess_calmar) if np.isfinite(excess_calmar) else np.nan,
+            "excess_downside_risk_annual": float(excess_downside_risk_ann) if np.isfinite(excess_downside_risk_ann) else np.nan,
+            "treynor": float(treynor) if np.isfinite(treynor) else np.nan,
+            "m2": float(m2) if np.isfinite(m2) else np.nan,
         }
 
     # ----------------------------- 可视化 ----------------------------- #
@@ -784,20 +882,258 @@ class NavAnalyzer:
                 pivot.to_excel(writer, sheet_name="MonthlyExcess")
 
     # ----------------------------- 工具方法 ----------------------------- #
-    def metrics_dataframe(self) -> pd.DataFrame:
+    def metrics_dataframe(self, view: str = "full", ordered: bool = True, metrics: Optional[Iterable[str]] = None) -> pd.DataFrame:
         if self.summary_ is None:
             raise RuntimeError("请先调用 fit()。")
-        return pd.DataFrame({"metric": list(self.summary_.keys()), "value": list(self.summary_.values())}).set_index("metric")
+        data = self.summary_.copy()
+        # 选择列
+        if metrics is not None:
+            keys = [k for k in metrics if k in data]
+        elif view == "core":
+            keys = self._core_metric_keys(has_benchmark=(self.bm_ret_ is not None and len(self.bm_ret_) > 0))
+            keys = [k for k in keys if k in data]
+        else:
+            keys = list(data.keys())
+        # 排序
+        if ordered:
+            order_map = {k: i for i, k in enumerate(self._logical_order())}
+            keys.sort(key=lambda k: order_map.get(k, len(order_map) + 1))
+        return pd.DataFrame({"metric": keys, "value": [data.get(k) for k in keys]}).set_index("metric")
 
     def metrics_excess_dataframe(self) -> pd.DataFrame:
         """
         返回与超额/主动相关的指标表（便于导出/对比）。
-        包含：excess_*、active_te、active_ir、beta、alpha_annual、up_capture、down_capture。
+        包含：excess_*、active_te、active_ir、beta、alpha_annual、up_capture、down_capture、r2、alpha_tstat、beta_tstat、treynor、m2。
         """
         if self.summary_ is None:
             raise RuntimeError("请先调用 fit()。")
         keys = [k for k in self.summary_.keys() if k.startswith("excess_")] + [
-            "active_te", "active_ir", "beta", "alpha_annual", "up_capture", "down_capture"
+            "active_te", "active_ir", "beta", "alpha_annual", "up_capture", "down_capture",
+            "r2", "alpha_tstat", "beta_tstat", "treynor", "m2"
         ]
         data = {k: self.summary_.get(k, None) for k in keys}
         return pd.DataFrame({"metric": list(data.keys()), "value": list(data.values())}).set_index("metric")
+
+    # ----------------------------- 内部：扁平化/核心/排序 ----------------------------- #
+    @staticmethod
+    def _flatten_frequency_detail(detail: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        if not isinstance(detail, dict):
+            return out
+        if "type" in detail:
+            out["freq_type"] = detail.get("type")
+        # calendar
+        if "weekend_ratio" in detail:
+            out["weekend_ratio"] = detail.get("weekend_ratio")
+        if "na_ratio" in detail:
+            out["na_ratio"] = detail.get("na_ratio")
+        # trading
+        if "median_obs_per_week" in detail:
+            out["median_obs_per_week"] = detail.get("median_obs_per_week")
+        if "median_obs_per_month" in detail:
+            out["median_obs_per_month"] = detail.get("median_obs_per_month")
+        if "trading_days_per_year_used" in detail:
+            out["trading_days_per_year_used"] = detail.get("trading_days_per_year_used")
+        if "weeks_per_year_used" in detail:
+            out["weeks_per_year_used"] = detail.get("weeks_per_year_used")
+        return out
+
+    @staticmethod
+    def _core_metric_keys(has_benchmark: bool) -> list:
+        base = [
+            "period_return",
+            "annual_return",
+            "vol_annual",
+            "sharpe",
+            "calmar",
+            "max_drawdown",
+        ]
+        if has_benchmark:
+            base += [
+                "excess_period_return",
+                "excess_annual_return",
+                "active_te",      # 对应 vol_annual（主动波动=TE）
+                "active_ir",      # 对应 sharpe（主动信息比）
+                "excess_calmar",
+                "excess_max_drawdown",
+            ]
+        return base
+
+    @staticmethod
+    def _logical_order() -> list:
+        return [
+            # 样本信息
+            "frequency", "periods_per_year", "stats_start", "stats_end", "n_periods",
+            # 频率细节（已扁平化）
+            "freq_type", "weekend_ratio", "na_ratio", "median_obs_per_week", "median_obs_per_month",
+            "trading_days_per_year_used", "weeks_per_year_used",
+            # 收益水平
+            "period_return", "annual_return",
+            # 风险水平
+            "vol_annual", "downside_risk_annual",
+            # 风险调整
+            "sharpe", "sortino", "calmar",
+            # 回撤
+            "max_drawdown", "max_drawdown_start", "max_drawdown_trough", "max_drawdown_recover",
+            "longest_underwater_periods", "longest_underwater_start", "longest_underwater_end",
+            # 基准对应（bm_*）
+            "bm_period_return", "bm_annual_return", "bm_vol_annual", "bm_sharpe", "bm_sortino", "bm_calmar",
+            # 主动/超额
+            "excess_period_return", "excess_annual_return", "active_te", "active_ir", "excess_calmar",
+            "excess_max_drawdown", "excess_max_drawdown_start", "excess_max_drawdown_trough", "excess_max_drawdown_recover",
+            "excess_longest_underwater_periods", "excess_longest_underwater_start", "excess_longest_underwater_end",
+            "beta", "alpha_annual", "up_capture", "down_capture",
+        ]
+
+    # ----------------------------- 导出（视图选择） ----------------------------- #
+    def export_report_excel(
+        self,
+        filepath: str,
+        view: str = "full",
+        ordered: bool = True,
+        metrics: Optional[Iterable[str]] = None,
+        chinese_label: bool = False,
+        formatted: bool = False,
+    ) -> None:
+        """
+        导出多表 Excel 报告：Summary、ExcessMetrics、MonthlyReturns、MonthlyExcess。
+        支持选择精简视图（core）。
+        """
+        if self.summary_ is None:
+            raise RuntimeError("请先调用 fit()。")
+        with pd.ExcelWriter(filepath) as writer:
+            df_summary = self.metrics_dataframe(view=view, ordered=ordered, metrics=metrics)
+            if chinese_label or formatted:
+                df_summary = self._format_metrics_dataframe(df_summary, chinese_label=chinese_label, formatted=formatted)
+            df_summary.to_excel(writer, sheet_name="Summary")
+            try:
+                df_excess = self.metrics_excess_dataframe()
+                if chinese_label or formatted:
+                    df_excess = self._format_metrics_dataframe(df_excess, chinese_label=chinese_label, formatted=formatted)
+                df_excess.to_excel(writer, sheet_name="ExcessMetrics")
+            except Exception:
+                pass
+            if self.ret_ is not None and len(self.ret_) > 0:
+                mret = (1 + self.ret_).resample("ME").prod() - 1.0
+                df = mret.to_frame("ret")
+                df["year"] = df.index.year
+                df["month"] = df.index.month
+                pivot = df.pivot(index="year", columns="month", values="ret")
+                pivot.to_excel(writer, sheet_name="MonthlyReturns")
+            if self.active_ret_ is not None and len(self.active_ret_) > 0:
+                mret = (1 + self.active_ret_).resample("ME").prod() - 1.0
+                df = mret.to_frame("ret")
+                df["year"] = df.index.year
+                df["month"] = df.index.month
+                pivot = df.pivot(index="year", columns="month", values="ret")
+                pivot.to_excel(writer, sheet_name="MonthlyExcess")
+
+    # -------- 输出格式与中文列名 -------- #
+    def _format_metrics_dataframe(self, df: pd.DataFrame, chinese_label: bool, formatted: bool) -> pd.DataFrame:
+        mapping = self._metric_catalog_cn()
+        out = df.copy()
+        # 添加 label 列，并按需格式化 value
+        labels = []
+        values = []
+        for k, row in out.iterrows():
+            meta = mapping.get(k, {"label": k, "fmt": "raw"})
+            label = meta.get("label", k)
+            val = row["value"]
+            if formatted:
+                val = self._format_value(val, meta.get("fmt", "raw"))
+            labels.append(label)
+            values.append(val)
+        out["value"] = values
+        if chinese_label:
+            out.insert(0, "label", labels)
+        return out
+
+    @staticmethod
+    def _format_value(val: Any, fmt: str) -> Any:
+        if val is None or (isinstance(val, float) and (not np.isfinite(val))):
+            return val
+        if fmt == "pct":
+            return f"{val*100:.2f}%"
+        if fmt == "pct1":
+            return f"{val*100:.1f}%"
+        if fmt == "ratio":
+            return f"{val:.3f}"
+        if fmt == "number":
+            return f"{val:.4f}"
+        if fmt == "int":
+            try:
+                return int(val)
+            except Exception:
+                return val
+        if fmt == "date":
+            try:
+                return pd.Timestamp(val).strftime("%Y-%m-%d") if val is not None else None
+            except Exception:
+                return val
+        return val
+
+    @staticmethod
+    def _metric_catalog_cn() -> Dict[str, Dict[str, str]]:
+        # 仅列出常见指标；未列出的按原 key 与原值返回
+        return {
+            # 样本
+            "frequency": {"label": "频率", "fmt": "raw"},
+            "periods_per_year": {"label": "年化期数", "fmt": "int"},
+            "stats_start": {"label": "起始日期", "fmt": "date"},
+            "stats_end": {"label": "结束日期", "fmt": "date"},
+            "n_periods": {"label": "样本期数", "fmt": "int"},
+            # 收益
+            "period_return": {"label": "区间收益", "fmt": "pct"},
+            "annual_return": {"label": "年化收益", "fmt": "pct"},
+            # 风险
+            "vol_annual": {"label": "年化波动", "fmt": "pct"},
+            "downside_risk_annual": {"label": "年化下行风险", "fmt": "pct"},
+            "upside_vol_annual": {"label": "年化上行波动", "fmt": "pct"},
+            # 风险调整
+            "sharpe": {"label": "夏普比", "fmt": "number"},
+            "sortino": {"label": "索提诺比", "fmt": "number"},
+            "calmar": {"label": "卡玛比", "fmt": "number"},
+            # 回撤
+            "max_drawdown": {"label": "最大回撤", "fmt": "pct"},
+            "max_drawdown_start": {"label": "回撤开始", "fmt": "date"},
+            "max_drawdown_trough": {"label": "回撤谷底", "fmt": "date"},
+            "max_drawdown_recover": {"label": "回撤修复", "fmt": "date"},
+            # 分布/尾部
+            "skewness": {"label": "偏度", "fmt": "number"},
+            "kurtosis": {"label": "峰度", "fmt": "number"},
+            "VaR_95": {"label": "VaR(95%)", "fmt": "pct"},
+            "CVaR_95": {"label": "CVaR(95%)", "fmt": "pct"},
+            # 一致性
+            "win_rate": {"label": "胜率", "fmt": "pct"},
+            "avg_up_return": {"label": "平均上涨收益", "fmt": "pct"},
+            "avg_down_return": {"label": "平均下跌收益", "fmt": "pct"},
+            "gain_loss_ratio": {"label": "盈亏比", "fmt": "number"},
+            "max_consecutive_up": {"label": "最大连涨期数", "fmt": "int"},
+            "max_consecutive_down": {"label": "最大连跌期数", "fmt": "int"},
+            # 基准
+            "beta": {"label": "Beta", "fmt": "number"},
+            "alpha_annual": {"label": "Alpha(年化)", "fmt": "pct"},
+            "alpha_tstat": {"label": "Alpha t 统计", "fmt": "number"},
+            "beta_tstat": {"label": "Beta t 统计", "fmt": "number"},
+            "r2": {"label": "拟合优度 R^2", "fmt": "number"},
+            "treynor": {"label": "特雷诺比率", "fmt": "number"},
+            "m2": {"label": "M平方", "fmt": "pct"},
+            "up_capture": {"label": "上行捕获", "fmt": "ratio"},
+            "down_capture": {"label": "下行捕获", "fmt": "ratio"},
+            # 超额
+            "excess_period_return": {"label": "超额区间收益", "fmt": "pct"},
+            "excess_annual_return": {"label": "超额年化收益", "fmt": "pct"},
+            "active_te": {"label": "跟踪误差(年化)", "fmt": "pct"},
+            "active_ir": {"label": "信息比率", "fmt": "number"},
+            "excess_calmar": {"label": "超额卡玛比", "fmt": "number"},
+            "excess_max_drawdown": {"label": "超额最大回撤", "fmt": "pct"},
+            "excess_max_drawdown_start": {"label": "超额回撤开始", "fmt": "date"},
+            "excess_max_drawdown_trough": {"label": "超额回撤谷底", "fmt": "date"},
+            "excess_max_drawdown_recover": {"label": "超额回撤修复", "fmt": "date"},
+            "excess_longest_underwater_periods": {"label": "超额最长回撤期数", "fmt": "int"},
+            "excess_longest_underwater_start": {"label": "超额最长回撤开始", "fmt": "date"},
+            "excess_longest_underwater_end": {"label": "超额最长回撤结束", "fmt": "date"},
+            "excess_downside_risk_annual": {"label": "超额下行风险(年化)", "fmt": "pct"},
+            "hit_ratio_vs_bm": {"label": "战胜基准胜率", "fmt": "pct"},
+            "excess_win_rate": {"label": "超额胜率", "fmt": "pct"},
+        }

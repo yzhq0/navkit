@@ -37,23 +37,70 @@ class NavBatch:
             self.analyzers[name] = an
         return self
 
-    def summaries_dataframe(self, metrics: Optional[Iterable[str]] = None) -> pd.DataFrame:
+    def summaries_dataframe(
+        self,
+        metrics: Optional[Iterable[str]] = None,
+        view: str = "full",
+        ordered: bool = True,
+    ) -> pd.DataFrame:
         """
         将各对象的 summary_ 萃取为 DataFrame（index=名称）。
-        如果指定 metrics，则只导出所选指标列。
+        - metrics：仅导出所选指标列；
+        - view："full" | "core"；
+        - ordered：是否按逻辑顺序排列列。
         """
-        rows = {}
+        # 收集每个对象的视图（借用 NavAnalyzer.metrics_dataframe 的列选择逻辑保持一致）
+        per_name_frames = {}
         for name, an in self.analyzers.items():
-            summ = an.summary_ if an.summary_ is not None else {}
-            rows[name] = summ if metrics is None else {k: summ.get(k) for k in metrics}
-        return pd.DataFrame.from_dict(rows, orient="index")
+            if an.summary_ is None:
+                continue
+            df = an.metrics_dataframe(view=view, ordered=False, metrics=metrics)
+            per_name_frames[name] = df
 
-    def summaries_to_csv(self, filepath: str) -> None:
-        df = self.summaries_dataframe()
+        # 统一列集合（保持稳定顺序）
+        all_keys = []
+        for df in per_name_frames.values():
+            for k in df.index.tolist():
+                if k not in all_keys:
+                    all_keys.append(k)
+
+        # 逻辑排序
+        if ordered and len(self.analyzers) > 0:
+            # 取第一个 analyzer 的顺序定义
+            any_an = next(iter(self.analyzers.values()))
+            order_map = {k: i for i, k in enumerate(any_an._logical_order())}
+            all_keys.sort(key=lambda k: order_map.get(k, len(order_map) + 1))
+
+        # 组装为宽表
+        rows = {}
+        for name, df in per_name_frames.items():
+            value_map = df["value"].to_dict()
+            rows[name] = {k: value_map.get(k, None) for k in all_keys}
+        return pd.DataFrame.from_dict(rows, orient="index")[all_keys]
+
+    def summaries_to_csv(self, filepath: str, metrics: Optional[Iterable[str]] = None, view: str = "full", ordered: bool = True) -> None:
+        df = self.summaries_dataframe(metrics=metrics, view=view, ordered=ordered)
         df.to_csv(filepath)
 
-    def summaries_to_excel(self, filepath: str) -> None:
-        df = self.summaries_dataframe()
+    def summaries_to_excel(self, filepath: str, metrics: Optional[Iterable[str]] = None, view: str = "full", ordered: bool = True, chinese_label: bool = False, formatted: bool = False) -> None:
+        df = self.summaries_dataframe(metrics=metrics, view=view, ordered=ordered)
+        if chinese_label or formatted:
+            # 借用任一 analyzer 的格式映射
+            any_an = next(iter(self.analyzers.values())) if len(self.analyzers) else None
+            if any_an is not None:
+                # 将宽表转换为 metric/value 长表再格式化
+                fmt_map = any_an._metric_catalog_cn()
+                df_fmt = df.copy()
+                # 逐列格式化
+                for col in df_fmt.columns:
+                    meta = fmt_map.get(col, {"label": col, "fmt": "raw"})
+                    if formatted:
+                        df_fmt[col] = df_fmt[col].apply(lambda v, f=meta.get("fmt", "raw"): any_an._format_value(v, f))
+                if chinese_label:
+                    rename_map = {col: fmt_map.get(col, {"label": col}).get("label", col) for col in df_fmt.columns}
+                    df = df_fmt.rename(columns=rename_map)
+                else:
+                    df = df_fmt
         with pd.ExcelWriter(filepath) as writer:
             df.to_excel(writer, sheet_name="Summaries")
 
