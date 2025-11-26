@@ -9,7 +9,37 @@ from typing import Optional, Dict, Any, Tuple, Iterable
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 
+FONT_CANDIDATES_FOR_CN = [
+    "Microsoft YaHei",
+    "SimHei",
+    "Source Han Sans SC",
+    "Noto Sans CJK SC",
+    "WenQuanYi Micro Hei",
+]
+_FONT_INITIALIZED = False
+
+def _init_chinese_font() -> None:
+    """
+    尝试设置可显示中文的字体，避免图例/标题出现乱码。
+    仅执行一次；未找到候选字体时保持默认字体。
+    """
+    global _FONT_INITIALIZED
+    if _FONT_INITIALIZED:
+        return
+    for fam in FONT_CANDIDATES_FOR_CN:
+        try:
+            font_manager.findfont(fam, fallback_to_default=False)
+            plt.rcParams["font.family"] = fam
+            break
+        except Exception:
+            continue
+    plt.rcParams["axes.unicode_minus"] = False
+    _FONT_INITIALIZED = True
+
+
+_init_chinese_font()
 
 logger = logging.getLogger("NavAnalyzer")
 logger.setLevel(logging.INFO)
@@ -125,11 +155,12 @@ class NavAnalyzer:
     def _clean_series(s: Optional[pd.Series], name: str) -> Optional[pd.Series]:
         if s is None:
             return None
+        s = s.copy()
         if not isinstance(s.index, pd.DatetimeIndex):
-            s = s.copy()
             s.index = pd.to_datetime(s.index)
         s = s[~s.index.duplicated()].sort_index()
-        s.name = name
+        if s.name is None or (isinstance(s.name, str) and s.name.strip() == ""):
+            s.name = name
         return s.astype(float)
 
     def _get_trading_days_for_span(self, start: pd.Timestamp, end: pd.Timestamp) -> pd.DatetimeIndex:
@@ -626,20 +657,35 @@ class NavAnalyzer:
         }
 
     # ----------------------------- 可视化 ----------------------------- #
-    def plot_nav_vs_benchmark(self) -> plt.Axes:
+    @staticmethod
+    def _series_label(s: Optional[pd.Series], fallback: str, prefer_name: bool) -> str:
+        if not prefer_name or s is None:
+            return fallback
+        name = getattr(s, "name", None)
+        if name is None:
+            return fallback
+        name_str = str(name).strip()
+        return name_str if name_str else fallback
+
+    def plot_nav_vs_benchmark(self, use_series_name: bool = True) -> plt.Axes:
         if self.nav_ is None:
             raise RuntimeError("请先调用 fit()。")
         base = self.nav_.dropna()
         wealth = base / base.iloc[0]
         fig, ax = plt.subplots(figsize=(9, 4.5))
-        wealth.plot(ax=ax, linewidth=1.5, label="Series")
+        nav_label = self._series_label(self.nav_, fallback="Series", prefer_name=use_series_name)
+        wealth.plot(ax=ax, linewidth=1.5, label=nav_label)
         if self.bm_ is not None:
             bm = self.bm_.dropna()
-            (bm / bm.iloc[0]).plot(ax=ax, linewidth=1.0, linestyle="--", label="Benchmark")
+            bm_label = self._series_label(self.bm_, fallback="Benchmark", prefer_name=use_series_name)
+            (bm / bm.iloc[0]).plot(ax=ax, linewidth=1.0, linestyle="--", label=bm_label)
             if self.active_ret_ is not None and len(self.active_ret_) > 0:
                 active_wealth = (1.0 + self.active_ret_).cumprod()
                 active_wealth = pd.Series(active_wealth.values, index=self.active_ret_.index)
-                active_wealth.plot(ax=ax, linewidth=1.0, label="Excess (Fund-BM)")
+                active_label = "Excess (Fund-BM)"
+                if use_series_name and (nav_label != "Series" or bm_label != "Benchmark"):
+                    active_label = f"Excess ({nav_label}-{bm_label})"
+                active_wealth.plot(ax=ax, linewidth=1.0, label=active_label)
         ax.set_title("Cumulative Index (normalized)")
         ax.set_ylabel("Wealth Index / Excess Index")
         ax.legend()

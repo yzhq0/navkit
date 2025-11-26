@@ -17,6 +17,7 @@ ENV/
 
 # Jupyter
 .ipynb_checkpoints
+*.ipynb
 
 # Pytest / coverage
 .coverage

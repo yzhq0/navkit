@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "navkit"
-version = "0.1.4"
+version = "0.1.5"
 description = "NAV & portfolio performance analytics with trading-day-aware resampling for China A-share markets."
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
-authors = [{name="Zhengquan & ChatGPT", email="example@example.com"}]
+authors = [{name="Zhengquan & ChatGPT", email="yangzhq0@live.com"}]
 keywords = ["NAV", "fund", "portfolio", "analytics", "performance", "China", "trading calendar"]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -28,4 +28,4 @@ dependencies = [
 cal = ["pandas-market-calendars>=4.4.0", "exchange-calendars>=4.5.0"]
 
 [project.urls]
-Homepage = "https://example.com/navkit"
+Homepage = "https://github.com/yzhq0/navkit"
