@@ -41,6 +41,42 @@ def _init_chinese_font() -> None:
 
 _init_chinese_font()
 
+def calculate_adjusted_nav(unit_nav: pd.Series, acc_nav: pd.Series, base: Optional[float] = None) -> pd.Series:
+    """
+    基于单位净值与累计净值计算复权净值（分红再投资）。
+    - unit_nav 与 acc_nav 必须共享相同的索引（同序）。
+    - base 默认：若首日单位/累计净值相同则取首日净值，否则为 1。
+    """
+    if unit_nav.index.sort_values().equals(acc_nav.index.sort_values()) is False:
+        raise ValueError("unit_nav 和 acc_nav 必须具有相同的索引")
+    u = unit_nav.sort_index().astype(float)
+    a = acc_nav.sort_index().astype(float)
+    if not u.index.equals(a.index):
+        raise ValueError("unit_nav 和 acc_nav 必须具有相同的索引顺序")
+
+    if (u == a).all():
+        out = u.copy()
+        out.name = unit_nav.name or "adjusted_nav"
+        return out
+
+    # 当日分红 = (累计净值 - 单位净值) 的增量；负值视为 0
+    div = (a - u).diff().fillna(0.0).clip(lower=0.0)
+    # 收益率 = (净值变动 + 当日分红) / 昨日净值
+    denom = u.shift(1)
+    ret = (u.diff() + div) / denom
+    ret.iloc[0] = 0.0
+    ret = ret.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    adj_nav = (1.0 + ret).cumprod()
+    if base is None:
+        if np.isfinite(u.iloc[0]) and np.isfinite(a.iloc[0]) and np.isclose(u.iloc[0], a.iloc[0]):
+            base = float(u.iloc[0])
+        else:
+            base = 1.0
+    adj_nav = adj_nav * float(base)
+    adj_nav.name = unit_nav.name or "adjusted_nav"
+    return adj_nav
+
 logger = logging.getLogger("NavAnalyzer")
 logger.setLevel(logging.INFO)
 
@@ -667,7 +703,12 @@ class NavAnalyzer:
         name_str = str(name).strip()
         return name_str if name_str else fallback
 
-    def plot_nav_vs_benchmark(self, use_series_name: bool = True) -> plt.Axes:
+    def plot_nav(self, include_benchmark: bool = True, show_active: bool = True, use_series_name: bool = True) -> plt.Axes:
+        """
+        绘制归一化的净值曲线；可选叠加基准与超额曲线。
+        include_benchmark: True 时叠加基准（若存在），否则仅画净值。
+        show_active: True 时在有基准的情况下叠加超额曲线。
+        """
         if self.nav_ is None:
             raise RuntimeError("请先调用 fit()。")
         base = self.nav_.dropna()
@@ -675,22 +716,29 @@ class NavAnalyzer:
         fig, ax = plt.subplots(figsize=(9, 4.5))
         nav_label = self._series_label(self.nav_, fallback="Series", prefer_name=use_series_name)
         wealth.plot(ax=ax, linewidth=1.5, label=nav_label)
-        if self.bm_ is not None:
+        if include_benchmark and self.bm_ is not None:
             bm = self.bm_.dropna()
             bm_label = self._series_label(self.bm_, fallback="Benchmark", prefer_name=use_series_name)
             (bm / bm.iloc[0]).plot(ax=ax, linewidth=1.0, linestyle="--", label=bm_label)
-            if self.active_ret_ is not None and len(self.active_ret_) > 0:
+            if show_active and self.active_ret_ is not None and len(self.active_ret_) > 0:
                 active_wealth = (1.0 + self.active_ret_).cumprod()
                 active_wealth = pd.Series(active_wealth.values, index=self.active_ret_.index)
                 active_label = "Excess (Fund-BM)"
                 if use_series_name and (nav_label != "Series" or bm_label != "Benchmark"):
                     active_label = f"Excess ({nav_label}-{bm_label})"
                 active_wealth.plot(ax=ax, linewidth=1.0, label=active_label)
-        ax.set_title("Cumulative Index (normalized)")
+        title = "Cumulative Index (normalized)" if include_benchmark and self.bm_ is not None else "Cumulative NAV (normalized)"
+        ax.set_title(title)
         ax.set_ylabel("Wealth Index / Excess Index")
         ax.legend()
         ax.grid(True, alpha=0.25)
         return ax
+
+    def plot_nav_vs_benchmark(self, use_series_name: bool = True, show_active: bool = True) -> plt.Axes:
+        """
+        兼容旧接口：绘制净值并叠加基准与超额曲线。
+        """
+        return self.plot_nav(include_benchmark=True, show_active=show_active, use_series_name=use_series_name)
 
     def plot_drawdown(self) -> plt.Axes:
         if self.nav_ is None:
